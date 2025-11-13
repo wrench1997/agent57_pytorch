@@ -1,7 +1,7 @@
 import pickle
 import collections
 
-import gym
+
 import lz4.frame as lz4f
 import ray
 import torch
@@ -12,6 +12,11 @@ from model import EmbeddingNet, LifeLongNet, QNetwork
 from utils import (UCB, create_beta_list, create_gamma_list,
                    get_preprocess_func, inverse_rescaling, play_episode,
                    rescaling, segments2contents, transformed_retrace_operator)
+                   
+import gymnasium as gym
+import ale_py
+
+gym.register_envs(ale_py)  # unnecessary but helpful for IDEs
 
 
 @ray.remote(num_cpus=1)

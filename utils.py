@@ -1,10 +1,13 @@
 import collections
 import random
 
-import gym
+import gymnasium as gym
 import numpy as np
 import torch
 from PIL import Image
+import ale_py
+
+gym.register_envs(ale_py)  # unnecessary but helpful for IDEs
 
 
 def rescaling(x):
@@ -303,7 +306,8 @@ def play_episode(frame_process_func,
     """
     
     env = gym.make(env_name)
-    frame = frame_process_func(env.reset())
+    observation, _ = env.reset()
+    frame = frame_process_func(observation)
     
     # (n_frames, 84, 84)
     frames = collections.deque([frame] * n_frames, maxlen=n_frames)
@@ -351,7 +355,9 @@ def play_episode(frame_process_func,
             action = np.argmax(qvalue.detach().numpy())
 
         # step enviroment
-        next_frame, ex_reward, done, info = env.step(action)
+        next_frame, ex_reward, terminated, truncated, info = env.step(action)
+        # print(f"info111111111111 {info}")
+        done = terminated or truncated
         frames.append(frame_process_func(next_frame))
         
         # batching (1, n_frames, 84, 84)
@@ -381,8 +387,8 @@ def play_episode(frame_process_func,
             episode_reward += ex_reward
             
         else:
-            if lives != info["ale.lives"] or done:  # done==True when lose life
-                lives = info["ale.lives"]
+            if lives != info["lives"] or done:  # done==True when lose life
+                lives = info["lives"]
                 transition = (prev_ex_reward, prev_in_reward, prev_action,
                               state, action, in_h, in_c, ex_h, ex_c, j,
                               True, ex_reward, in_reward, next_state)

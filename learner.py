@@ -2,7 +2,8 @@ import os
 import pickle
 from concurrent import futures
 
-import gym
+import gymnasium as gym
+
 import lz4.frame as lz4f
 import numpy as np
 import ray
@@ -15,6 +16,9 @@ from model import EmbeddingClassifer, EmbeddingNet, LifeLongNet, QNetwork
 from utils import (create_beta_list, create_gamma_list, get_preprocess_func,
                    inverse_rescaling, rescaling, segments2contents,
                    transformed_retrace_operator)
+import ale_py
+
+gym.register_envs(ale_py)  # unnecessary but helpful for IDEs
 
 
 @ray.remote(num_cpus=1, num_gpus=1)
@@ -99,6 +103,8 @@ class Learner:
         
         self.original_lifelong_net = LifeLongNet(n_frames)
         self.trained_lifelong_net = LifeLongNet(n_frames)
+        # 先将模型移动到设备上
+        self.set_device()
         
         # set optimizer
         self.in_q_optimizer = optim.Adam(self.in_online_q_network.parameters(), lr=in_q_lr)
@@ -144,39 +150,42 @@ class Learner:
         define network and get initial parameter to copy to angents
         """
 
-        frame = self.frame_process_func(self.env.reset())
+        observation, _ = self.env.reset()
+        frame = self.frame_process_func(observation)
         frames = [frame] * self.n_frames
         
-        # (1, n_frams, 32, 32)
-        state = torch.tensor(np.stack(frames, axis=0)[None, ...]).float()
-        h = torch.zeros(1, 1, self.in_online_q_network.lstm.hidden_size).float()
-        c = torch.zeros(1, 1, self.ex_online_q_network.lstm.hidden_size).float()
+        # 将输入数据移动到与模型相同的设备上
+        state = torch.tensor(np.stack(frames, axis=0)[None, ...]).float().to(self.device)
+        h = torch.zeros(1, 1, self.in_online_q_network.lstm.hidden_size).float().to(self.device)
+        c = torch.zeros(1, 1, self.ex_online_q_network.lstm.hidden_size).float().to(self.device)
+        prev_action = torch.tensor([0]).to(self.device)
+        prev_rewards = torch.tensor([0]).float().to(self.device)
 
         self.in_online_q_network(state,
-                                 states=(h, c),
-                                 prev_action=torch.tensor([0]),
-                                 j=torch.tensor([0]),
-                                 prev_in_rewards=torch.tensor([0]),
-                                 prev_ex_rewards=torch.tensor([0]))
+                                states=(h, c),
+                                prev_action=prev_action,
+                                j=prev_action,  # 使用相同的张量作为j
+                                prev_in_rewards=prev_rewards,
+                                prev_ex_rewards=prev_rewards)
         self.ex_online_q_network(state,
-                                 states=(h, c),
-                                 prev_action=torch.tensor([0]),
-                                 j=torch.tensor([0]),
-                                 prev_in_rewards=torch.tensor([0]),
-                                 prev_ex_rewards=torch.tensor([0]))
+                                states=(h, c),
+                                prev_action=prev_action,
+                                j=prev_action,  # 使用相同的张量作为j
+                                prev_in_rewards=prev_rewards,
+                                prev_ex_rewards=prev_rewards)
 
         self.in_target_q_network(state,
-                                 states=(h, c),
-                                 prev_action=torch.tensor([0]),
-                                 j=torch.tensor([0]),
-                                 prev_in_rewards=torch.tensor([0]),
-                                 prev_ex_rewards=torch.tensor([0]))
+                                states=(h, c),
+                                prev_action=prev_action,
+                                j=prev_action,  # 使用相同的张量作为j
+                                prev_in_rewards=prev_rewards,
+                                prev_ex_rewards=prev_rewards)
         self.ex_target_q_network(state,
-                                 states=(h, c),
-                                 prev_action=torch.tensor([0]),
-                                 j=torch.tensor([0]),
-                                 prev_in_rewards=torch.tensor([0]),
-                                 prev_ex_rewards=torch.tensor([0]))
+                                states=(h, c),
+                                prev_action=prev_action,
+                                j=prev_action,  # 使用相同的张量作为j
+                                prev_in_rewards=prev_rewards,
+                                prev_ex_rewards=prev_rewards)
 
         control_state = self.embedding_net(state)
         self.original_lifelong_net(state)
@@ -186,16 +195,24 @@ class Learner:
         self.in_target_q_network.load_state_dict(self.in_online_q_network.state_dict())
         self.ex_target_q_network.load_state_dict(self.ex_online_q_network.state_dict())
 
+        # 将模型移回CPU以便传输给Agent
+        self.in_online_q_network.to('cpu')
+        self.ex_online_q_network.to('cpu')
+        self.embedding_net.to('cpu')
+        self.trained_lifelong_net.to('cpu')
+        self.original_lifelong_net.to('cpu')
+
         in_q_weight = self.in_online_q_network.state_dict()
         ex_q_weight = self.ex_online_q_network.state_dict()
         embed_weight = self.embedding_net.state_dict()
         trained_lifelong_weight = self.trained_lifelong_net.state_dict()
         original_lifelong_weight = self.original_lifelong_net.state_dict()
         
+        # 将模型移回设备
         self.set_device()
 
         return in_q_weight, ex_q_weight, embed_weight, trained_lifelong_weight, original_lifelong_weight
-
+      
     def save(self, weight_dir, cycle):
         """
         save weight
