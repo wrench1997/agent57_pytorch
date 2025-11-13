@@ -22,7 +22,7 @@ def main(args):
     os.makedirs("log")
 
     seed_evrything(args.seed)
-    ray.init(ignore_reinit_error=True, local_mode=False)
+    ray.init(ignore_reinit_error=True, local_mode=False,dashboard_host="0.0.0.0",dashboard_port=8265)
 
     total_s = time.time()
     in_q_loss_history, ex_q_loss_history, embed_loss_history, lifelong_loss_history, score_history = [], [], [], [], []
