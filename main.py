@@ -219,7 +219,7 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Agent57')
     # Agent
-    parser.add_argument('--num_agents', default=4, type=int)
+    parser.add_argument('--num_agents', default=2, type=int)
     parser.add_argument('--agent_update_period', default=100, type=int)
     parser.add_argument('--num_rollout', default=10, type=int)
     parser.add_argument('--epsilon_l', default=0.4, type=float)
@@ -254,8 +254,8 @@ if __name__ == '__main__':
     parser.add_argument('--lamda', default=0.95, type=float)
     parser.add_argument('--n_frames', default=4, type=int)
     parser.add_argument('--env_name', default="ALE/Breakout-v5")
-    parser.add_argument('--batch_size', default=32, type=int)
-    parser.add_argument('--update_iter', default=16, type=int)
+    parser.add_argument('--batch_size', default=16, type=int)
+    parser.add_argument('--update_iter', default=8, type=int)
     parser.add_argument('--burnin_length', default=40, type=int)
     parser.add_argument('--unroll_length', default=40, type=int)
     parser.add_argument('--n_agent_burnin', default=16, type=int)
