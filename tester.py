@@ -2,12 +2,13 @@ import collections
 
 import gymnasium as gym
 import numpy as np
-import torch
+import ray
 
 from model import EmbeddingNet, LifeLongNet, QNetwork
 from utils import UCB, create_beta_list, get_preprocess_func, play_episode
 
 
+@ray.remote(num_cpus=1)
 class Tester:
     """
     calculate score to evaluate peformance
@@ -82,7 +83,7 @@ class Tester:
         self.original_lifelong_net.load_state_dict(original_lifelong_weight)
         self.is_test = False
         self.count = 0
-        self.episode_reward = []
+        
     
     def test_play(self, in_q_weight, ex_q_weight, embed_weight, lifelong_weight):
         """
@@ -155,5 +156,3 @@ class Tester:
         elif self.count % self.switch_test_cycle == 0:
             self.is_test = False
             return np.mean(self.episode_reward)
-        
-        return None

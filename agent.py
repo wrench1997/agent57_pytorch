@@ -1,6 +1,9 @@
 import pickle
 import collections
 
+
+import lz4.frame as lz4f
+import ray
 import torch
 import torch.nn.functional as F
 
@@ -16,6 +19,7 @@ import ale_py
 gym.register_envs(ale_py)  # unnecessary but helpful for IDEs
 
 
+@ray.remote(num_cpus=1)
 class Agent:
     """
     collect experiments and get initial priority
@@ -214,7 +218,7 @@ class Agent:
             ex_priorities = self.get_priorities(ex_qvalues, self.ex_rewards)
 
             priorities = in_priorities + ex_priorities
-            compressed_segments = [pickle.dumps(seg) for seg in segments]
+            compressed_segments = [lz4f.compress(pickle.dumps(seg)) for seg in segments]
             
             # 显式删除大型变量
             del in_qvalues, ex_qvalues, self.states, self.actions, self.in_rewards, self.ex_rewards
@@ -304,4 +308,6 @@ class Agent:
         td_errors = rescaling(inverse_rescaling(Q) + P) - Q
         priorities = self.eta * torch.max(torch.abs(td_errors), dim=0).values + (1 - self.eta) * torch.mean(torch.abs(td_errors), dim=0)
         
-        return priorities
+        return  priorities
+
+

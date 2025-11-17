@@ -2,12 +2,9 @@ import argparse
 import os
 import shutil
 import time
-import pickle
-from concurrent.futures import ThreadPoolExecutor
 
 import matplotlib.pyplot as plt
-import numpy as np
-import torch
+import ray
 
 from agent import Agent
 from tester import Tester
@@ -25,144 +22,166 @@ def main(args):
     os.makedirs("log")
 
     seed_evrything(args.seed)
+    ray.init(ignore_reinit_error=True, local_mode=False,dashboard_host="0.0.0.0",dashboard_port=8265)
 
     total_s = time.time()
     in_q_loss_history, ex_q_loss_history, embed_loss_history, lifelong_loss_history, score_history = [], [], [], [], []
     
-    # 初始化Learner
-    learner = Learner(env_name=args.env_name,
-                      target_update_period=args.target_update_period,
-                      eta=args.eta,
-                      n_frames=args.n_frames,
-                      num_arms=args.num_arms,
-                      lamda=args.lamda,
-                      burnin_length=args.burnin_length,
-                      unroll_length=args.unroll_length,
-                      in_q_lr=args.in_q_lr,
-                      ex_q_lr=args.ex_q_lr,
-                      embed_lr=args.embed_lr,
-                      lifelong_lr=args.lifelong_lr,
-                      in_q_clip_grad=args.in_q_clip_grad,
-                      ex_q_clip_grad=args.ex_q_clip_grad,
-                      embed_clip_grad=args.embed_clip_grad,
-                      lifelong_clip_grad=args.lifelong_clip_grad)
+    learner = Learner.remote(env_name=args.env_name,
+                             target_update_period=args.target_update_period,
+                             eta=args.eta,
+                             n_frames=args.n_frames,
+                             num_arms=args.num_arms,
+                             lamda=args.lamda,
+                             burnin_length=args.burnin_length,
+                             unroll_length=args.unroll_length,
+                             in_q_lr=args.in_q_lr,
+                             ex_q_lr=args.ex_q_lr,
+                             embed_lr=args.embed_lr,
+                             lifelong_lr=args.lifelong_lr,
+                             in_q_clip_grad=args.in_q_clip_grad,
+                             ex_q_clip_grad=args.ex_q_clip_grad,
+                             embed_clip_grad=args.embed_clip_grad,
+                             lifelong_clip_grad=args.lifelong_clip_grad)
     
-    in_q_weight, ex_q_weight, embed_weight, trained_lifelong_weight, original_lifelong_weight = learner.define_network()
+    in_q_weight, ex_q_weight, embed_weight, trained_lifelong_weight, original_lifelong_weight = ray.get(learner.define_network.remote())
     
-    # 初始化Agents
-    agents = [Agent(pid=i,
-                    env_name=args.env_name,
-                    n_frames=args.n_frames,
-                    epsilon=args.epsilon_l ** (1 + args.alpha_l * i / (args.num_agents - 1)),
-                    eta=args.eta,
-                    lamda=args.lamda,
-                    agent_update_period=args.agent_update_period,
-                    num_rollout=args.num_rollout,
-                    num_arms=args.num_arms,
-                    k=args.k,
-                    L=args.L,
-                    burnin_length=args.burnin_length,
-                    unroll_length=args.unroll_length,
-                    window_size=args.window_size,
-                    ucb_epsilon=args.ucb_epsilon,
-                    ucb_beta=args.ucb_beta,
-                    original_lifelong_weight=original_lifelong_weight)
+    # put weights for agents to refer them
+    in_q_weight = ray.put(in_q_weight)
+    ex_q_weight = ray.put(ex_q_weight)
+    embed_weight = ray.put(embed_weight)
+    trained_lifelong_weight = ray.put(trained_lifelong_weight)
+    original_lifelong_weight = ray.put(original_lifelong_weight)
+
+    agents = [Agent.remote(pid=i,
+                           env_name=args.env_name,
+                           n_frames=args.n_frames,
+                           epsilon=args.epsilon_l ** (1 + args.alpha_l * i / (args.num_agents - 1)),
+                           eta=args.eta,
+                           lamda=args.lamda,
+                           agent_update_period=args.agent_update_period,
+                           num_rollout=args.num_rollout,
+                           num_arms=args.num_arms,
+                           k=args.k,
+                           L=args.L,
+                           burnin_length=args.burnin_length,
+                           unroll_length=args.unroll_length,
+                           window_size=args.window_size,
+                           ucb_epsilon=args.ucb_epsilon,
+                           ucb_beta=args.ucb_beta,
+                           original_lifelong_weight=original_lifelong_weight)
               for i in range(args.num_agents)]
 
     replay_buffer = SegmentReplayBuffer(buffer_size=args.buffer_size, weight_expo=args.weight_expo)   
 
-    # 初始化Tester
-    tester = Tester(env_name=args.env_name,
-                    n_frames=args.n_frames,
-                    num_arms=args.num_arms,
-                    L=args.L,
-                    k=args.k,
-                    window_size=args.window_size,
-                    ucb_epsilon=args.ucb_epsilon,
-                    ucb_beta=args.ucb_beta,
-                    switch_test_cycle=args.switch_test_cycle,
-                    original_lifelong_weight=original_lifelong_weight)
+    tester = Tester.remote(env_name=args.env_name,
+                           n_frames=args.n_frames,
+                           num_arms=args.num_arms,
+                           L=args.L,
+                           k=args.k,
+                           window_size=args.window_size,
+                           ucb_epsilon=args.ucb_epsilon,
+                           ucb_beta=args.ucb_beta,
+                           switch_test_cycle=args.switch_test_cycle,
+                           original_lifelong_weight=original_lifelong_weight)
 
-    # 使用线程池来并行执行Agent的rollout
-    with ThreadPoolExecutor(max_workers=args.num_agents) as executor:
-        # 初始填充经验池
-        for i in range(args.n_agent_burnin):
-            s = time.time()
-            
-            # 随机选择一个agent
-            agent_idx = i % args.num_agents
-            priorities, segments, pid = agents[agent_idx].sync_weights_and_rollout(
-                in_q_weight=in_q_weight,
-                ex_q_weight=ex_q_weight,
-                embed_weight=embed_weight,
-                lifelong_weight=trained_lifelong_weight
-            )
-            
-            replay_buffer.add(priorities, segments)
-            
-            with open(f"log/agent_time_check.txt", mode="a") as f:
-                f.write(f"{i}th Agent's time[sec]: {time.time() - s:.5f}\n")
+    wip_agents = [agent.sync_weights_and_rollout.remote(in_q_weight=in_q_weight,
+                                                        ex_q_weight=ex_q_weight,
+                                                        embed_weight=embed_weight,
+                                                        lifelong_weight=trained_lifelong_weight)
+                  for agent in agents]
+
+    for i in range(args.n_agent_burnin):
+        s = time.time()
+        
+        # finised agent, working agents
+        finished, wip_agents = ray.wait(wip_agents, num_returns=1)
+        priorities, segments, pid = ray.get(finished[0])
+        
+        replay_buffer.add(priorities, segments)
+        
+        # 显式删除不再需要的Ray对象引用
+        del finished
+        
+        wip_agents.extend([agents[pid].sync_weights_and_rollout.remote(in_q_weight=in_q_weight,
+                                                                       ex_q_weight=ex_q_weight,
+                                                                       embed_weight=embed_weight,
+                                                                       lifelong_weight=trained_lifelong_weight)])
+        with open(f"log/agent_time_check.txt", mode="a") as f:
+            f.write(f"{i}th Agent's time[sec]: {time.time() - s:.5f}\n")
 
     print("="*100)
     
+    minibatchs = [replay_buffer.sample_minibatch(batch_size=args.batch_size) for _ in range(args.update_iter)]
+    wip_learner = learner.update_network.remote(minibatchs)
+    wip_tester = tester.test_play.remote(in_q_weight=in_q_weight,
+                                         ex_q_weight=ex_q_weight,
+                                         embed_weight=embed_weight,
+                                         lifelong_weight=trained_lifelong_weight)
+
     learner_cycles = 1
     agent_cycles = 0
     n_segment_added = 0
+    s = time.time()
 
     while learner_cycles <= args.n_learner_cycle:
         agent_cycles += 1
         s = time.time()
         
-        # 并行收集经验
-        futures = []
-        with ThreadPoolExecutor(max_workers=args.num_agents) as executor:
-            for agent_idx in range(args.num_agents):
-                future = executor.submit(
-                    agents[agent_idx].sync_weights_and_rollout,
-                    in_q_weight=in_q_weight,
-                    ex_q_weight=ex_q_weight,
-                    embed_weight=embed_weight,
-                    lifelong_weight=trained_lifelong_weight
-                )
-                futures.append(future)
+        # get agent's experience
+        finished, wip_agents = ray.wait(wip_agents, num_returns=1)
+        priorities, segments, pid = ray.get(finished[0])
+        replay_buffer.add(priorities, segments)
+        wip_agents.extend([agents[pid].sync_weights_and_rollout.remote(in_q_weight=in_q_weight,
+                                                                       ex_q_weight=ex_q_weight,
+                                                                       embed_weight=embed_weight,
+                                                                       lifelong_weight=trained_lifelong_weight)])
             
-            for future in futures:
-                priorities, segments, pid = future.result()
-                replay_buffer.add(priorities, segments)
-                n_segment_added += len(segments)
-        
-        # 从经验池中采样并更新网络
-        minibatchs = [replay_buffer.sample_minibatch(batch_size=args.batch_size) for _ in range(args.update_iter)]
-        in_q_weight, ex_q_weight, embed_weight, trained_lifelong_weight, indices, priorities, in_q_loss, ex_q_loss, embed_loss, lifelong_loss = learner.update_network(minibatchs)
-        
-        replay_buffer.update_priority(indices, priorities)
-        
-        with open(f"log/loss_history.txt", mode="a") as f:
-            f.write(f"{learner_cycles}th results => Agent cycle: {agent_cycles}, Added: {n_segment_added}, InQLoss: {in_q_loss:.4f}, ExQLoss: {ex_q_loss:.4f}, EmbeddingLoss: {embed_loss:.4f}, LifeLongLoss: {lifelong_loss:.8f} \n")
+        n_segment_added += len(segments)
 
-        in_q_loss_history.append((learner_cycles-1, in_q_loss))
-        ex_q_loss_history.append((learner_cycles-1, ex_q_loss))
-        embed_loss_history.append((learner_cycles-1, embed_loss))
-        lifelong_loss_history.append((learner_cycles-1, lifelong_loss))
+        finished_learner, _ = ray.wait([wip_learner], timeout=0)
 
-        # 测试当前策略
-        test_score = tester.test_play(in_q_weight=in_q_weight,
-                                     ex_q_weight=ex_q_weight,
-                                     embed_weight=embed_weight,
-                                     lifelong_weight=trained_lifelong_weight)
-        
-        if test_score is not None:
-            score_history.append((learner_cycles-args.switch_test_cycle, test_score))
-            with open(f"log/score_history.txt", mode="a") as f:
-                f.write(f"Cycle: {learner_cycles}, Score: {test_score}\n")
+        if finished_learner:
+            in_q_weight, ex_q_weight, embed_weight, trained_lifelong_weight, indices, priorities, in_q_loss, ex_q_loss, embed_loss, lifelong_loss = ray.get(finished_learner[0])
+            
+            replay_buffer.update_priority(indices, priorities)
+            minibatchs = [replay_buffer.sample_minibatch(batch_size=args.batch_size) for _ in range(args.update_iter)]
+            
+            wip_learner = learner.update_network.remote(minibatchs)
 
-        if learner_cycles % args.freq_weight_save == 0:
-            learner.save(weight_dir, learner_cycles)
+            in_q_weight = ray.put(in_q_weight)
+            ex_q_weight = ray.put(ex_q_weight)
+            embed_weight = ray.put(embed_weight)
+            trained_lifelong_weight = ray.put(trained_lifelong_weight)
 
-        learner_cycles += 1
-        agent_cycles = 0
-        n_segment_added = 0
-        s = time.time()
+            with open(f"log/loss_history.txt", mode="a") as f:
+                f.write(f"{learner_cycles}th results => Agent cycle: {agent_cycles}, Added: {n_segment_added}, InQLoss: {in_q_loss:.4f}, ExQLoss: {ex_q_loss:.4f}, EmbeddingLoss: {embed_loss:.4f}, LifeLongLoss: {lifelong_loss:.8f} \n")
+
+            in_q_loss_history.append((learner_cycles-1, in_q_loss))
+            ex_q_loss_history.append((learner_cycles-1, ex_q_loss))
+            embed_loss_history.append((learner_cycles-1, embed_loss))
+            lifelong_loss_history.append((learner_cycles-1, lifelong_loss))
+
+            test_score = ray.get(wip_tester)
+            if test_score is not None:
+                score_history.append((learner_cycles-args.switch_test_cycle, test_score))
+                with open(f"log/score_history.txt", mode="a") as f:
+                    f.write(f"Cycle: {learner_cycles}, Score: {test_score}\n")
+                    
+            wip_tester = tester.test_play.remote(in_q_weight=in_q_weight,
+                                                 ex_q_weight=ex_q_weight,
+                                                 embed_weight=embed_weight,
+                                                 lifelong_weight=trained_lifelong_weight)
+
+            if learner_cycles % args.freq_weight_save == 0:
+                learner.save.remote(weight_dir, learner_cycles)
+
+            learner_cycles += 1
+            agent_cycles = 0
+            n_segment_added = 0
+            s = time.time()
+
+    ray.shutdown()
 
     wallclocktime = round(time.time() - total_s, 2)
     cycles, scores = zip(*score_history)
