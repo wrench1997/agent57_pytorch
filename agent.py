@@ -1,9 +1,6 @@
 import pickle
 import collections
 
-
-import lz4.frame as lz4f
-import ray
 import torch
 import torch.nn.functional as F
 
@@ -19,7 +16,6 @@ import ale_py
 gym.register_envs(ale_py)  # unnecessary but helpful for IDEs
 
 
-@ray.remote(num_cpus=1)
 class Agent:
     """
     collect experiments and get initial priority
@@ -116,7 +112,7 @@ class Agent:
         self.unroll_len = unroll_length
         
         self.k = k
-        self.error_list = collections.deque(maxlen=int(1e4))
+        self.error_list = collections.deque(maxlen=int(1e3))
         self.L = L
         
         self.agent_update_period = agent_update_period
@@ -129,94 +125,109 @@ class Agent:
     def sync_weights_and_rollout(self, in_q_weight, ex_q_weight, embed_weight, lifelong_weight):
         """
         load weight and run rollout
-        Args:
-          in_q_weight     : weight of intrinsic q network
-          ex_q_weight     : weight of extrinsic q network
-          embed_weight    : weight of embedding network
-          lifelong_weight : weight of lifelong network
-        Returns:
-          priority  (list): priority of segments when pulling segments from sum tree
-          segments        : parts of expecimences
-          self.pid        : process id
         """
+        try:
+            if self.num_updates % self.agent_update_period == 0:
+                # 确保模型在CPU上
+                self.in_q_network.to('cpu')
+                self.ex_q_network.to('cpu')
+                self.embedding_net.to('cpu')
+                self.trained_lifelong_net.to('cpu')
+                
+                self.in_q_network.load_state_dict(in_q_weight)
+                self.ex_q_network.load_state_dict(ex_q_weight)
+                self.embedding_net.load_state_dict(embed_weight)
+                self.trained_lifelong_net.load_state_dict(lifelong_weight)
 
-        if self.num_updates % self.agent_update_period == 0:
-            self.in_q_network.load_state_dict(in_q_weight)
-            self.ex_q_network.load_state_dict(ex_q_weight)
-            self.embedding_net.load_state_dict(embed_weight)
-            self.trained_lifelong_net.load_state_dict(lifelong_weight)
+            priorities, segments = [], []
+            while len(segments) < self.num_rollout:
+                _priorities, _segments = self._rollout()
+                priorities += _priorities
+                segments += _segments
 
-        priorities, segments = [], []
-        while len(segments) < self.num_rollout:
-            _priorities, _segments = self._rollout()
-            priorities += _priorities
-            segments += _segments
-
-        self.num_updates += 1
-        return priorities, segments, self.pid
+            self.num_updates += 1
+            
+            # 显式清理不需要的变量
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()  # 如果使用GPU
+            
+            return priorities, segments, self.pid
+        except Exception as e:
+            import traceback
+            print(f"Error in sync_weights_and_rollout: {e}")
+            print(traceback.format_exc())
+            raise e
     
 
     def _rollout(self):
         """
         get priority and segments from collected experiments
-        Returns:
-          priorities    (list): priorities of segments when pulling segments from sum tree
-          compressed_segments : compressed segments in terms of  memory capacity
         """
+        try:
+            # get index from ucb
+            j = self.ucb.pull_index()
+            
+            # get beta gamma
+            beta, self.gamma = self.betas[j], self.gammas[j]
+
+            episode_buffer = EpisodeBuffer(burnin_length=self.burnin_len, unroll_length=self.unroll_len)
+
+            ucb_datas, transitions, self.error_list = play_episode(frame_process_func=self.frame_process_func,
+                                                                  env_name=self.env_name,
+                                                                  n_frames=self.n_frames,
+                                                                  action_space=self.action_space,
+                                                                  j=j,
+                                                                  epsilon=self.epsilon,
+                                                                  k=self.k,
+                                                                  error_list=self.error_list,
+                                                                  L=self.L,
+                                                                  beta=beta,
+                                                                  in_q_network=self.in_q_network,
+                                                                  ex_q_network=self.ex_q_network,
+                                                                  embedding_net=self.embedding_net,
+                                                                  original_lifelong_net=self.original_lifelong_net,
+                                                                  trained_lifelong_net=self.trained_lifelong_net)
+
+            self.ucb.push_data(ucb_datas)
+
+            for transition in transitions:
+                episode_buffer.add(transition)
+
+            segments = episode_buffer.pull_segments()
+            
+            self.states, self.actions, self.in_rewards, self.ex_rewards, self.dones, self.j, self.next_states, \
+                in_h0, in_c0, ex_h0, ex_c0, self.prev_in_rewards, self.prev_ex_rewards, self.prev_actions = segments2contents(segments, self.burnin_len)
+
+            # (unroll_len+1, batch_size, action_space)
+            with torch.no_grad():  # 添加no_grad以避免计算图累积
+                in_qvalues = self.get_qvalues(self.in_q_network, in_h0, in_c0)
+                ex_qvalues = self.get_qvalues(self.ex_q_network, ex_h0, ex_c0)
+
+            # (unroll_len+1, batch_size)
+            self.pi = torch.argmax(rescaling(inverse_rescaling(ex_qvalues) + beta * inverse_rescaling(in_qvalues)), dim=2)
+
+            # (unroll_len, batch_size, action_space)
+            self.actions_onehot = F.one_hot(self.actions[self.burnin_len:], num_classes=self.action_space)
+
+            in_priorities = self.get_priorities(in_qvalues, self.in_rewards)
+            ex_priorities = self.get_priorities(ex_qvalues, self.ex_rewards)
+
+            priorities = in_priorities + ex_priorities
+            compressed_segments = [pickle.dumps(seg) for seg in segments]
+            
+            # 显式删除大型变量
+            del in_qvalues, ex_qvalues, self.states, self.actions, self.in_rewards, self.ex_rewards
+            del self.dones, self.j, self.next_states, in_h0, in_c0, ex_h0, ex_c0
+            del self.prev_in_rewards, self.prev_ex_rewards, self.prev_actions, self.pi, self.actions_onehot
+            
+            return priorities.detach().numpy().tolist(), compressed_segments
         
-        # get index from ucb
-        j = self.ucb.pull_index()
-        
-        # get beta gamma
-        beta, self.gamma = self.betas[j], self.gammas[j]
-
-        episode_buffer = EpisodeBuffer(burnin_length=self.burnin_len, unroll_length=self.unroll_len)
-
-        ucb_datas, transitions, self.error_list = play_episode(frame_process_func=self.frame_process_func,
-                                                               env_name=self.env_name,
-                                                               n_frames=self.n_frames,
-                                                               action_space=self.action_space,
-                                                               j=j,
-                                                               epsilon=self.epsilon,
-                                                               k=self.k,
-                                                               error_list=self.error_list,
-                                                               L=self.L,
-                                                               beta=beta,
-                                                               in_q_network=self.in_q_network,
-                                                               ex_q_network=self.ex_q_network,
-                                                               embedding_net=self.embedding_net,
-                                                               original_lifelong_net=self.original_lifelong_net,
-                                                               trained_lifelong_net=self.trained_lifelong_net)
-
-        self.ucb.push_data(ucb_datas)
-
-        for transition in transitions:
-            episode_buffer.add(transition)
-
-        segments = episode_buffer.pull_segments()
-        
-        self.states, self.actions, self.in_rewards, self.ex_rewards, self.dones, self.j, self.next_states, \
-            in_h0, in_c0, ex_h0, ex_c0, self.prev_in_rewards, self.prev_ex_rewards, self.prev_actions = segments2contents(segments, self.burnin_len)
-
-        # (unroll_len+1, batch_size, action_space)
-        in_qvalues = self.get_qvalues(self.in_q_network, in_h0, in_c0)
-        
-        # (unroll_len+1, batch_size, action_space)
-        ex_qvalues = self.get_qvalues(self.ex_q_network, ex_h0, ex_c0)
-
-        # (unroll_len+1, batch_size)
-        self.pi = torch.argmax(rescaling(inverse_rescaling(ex_qvalues) + beta * inverse_rescaling(in_qvalues)), dim=2)
-
-        # (unroll_len, batch_size, action_space)
-        self.actions_onehot = F.one_hot(self.actions[self.burnin_len:], num_classes=self.action_space)
-
-        in_priorities = self.get_priorities(in_qvalues, self.in_rewards)
-        ex_priorities = self.get_priorities(ex_qvalues, self.ex_rewards)
-
-        priorities = in_priorities + ex_priorities
-        compressed_segments = [lz4f.compress(pickle.dumps(seg)) for seg in segments]
-        
-        return priorities.detach().numpy().tolist(), compressed_segments
+        except Exception as e:
+            import traceback
+            print(f"Error in _rollout: {e}")
+            print(traceback.format_exc())
+            raise e
 
     def get_qvalues(self, q_network, h, c):
         """
@@ -293,6 +304,4 @@ class Agent:
         td_errors = rescaling(inverse_rescaling(Q) + P) - Q
         priorities = self.eta * torch.max(torch.abs(td_errors), dim=0).values + (1 - self.eta) * torch.mean(torch.abs(td_errors), dim=0)
         
-        return  priorities
-
-
+        return priorities

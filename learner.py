@@ -4,9 +4,7 @@ from concurrent import futures
 
 import gymnasium as gym
 
-import lz4.frame as lz4f
 import numpy as np
-import ray
 import torch
 import torch.nn.functional as F
 from torch import optim
@@ -21,7 +19,6 @@ import ale_py
 gym.register_envs(ale_py)  # unnecessary but helpful for IDEs
 
 
-@ray.remote(num_cpus=1, num_gpus=1)
 class Learner:
     """
     update parameter
@@ -89,7 +86,7 @@ class Learner:
         self.n_frames = n_frames
         self.env = gym.make(self.env_name)
         self.action_space = self.env.action_space.n
-        self.device = torch.device("cuda") if torch.cuda.is_available else torch.device("cpu")
+        self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         self.frame_process_func = get_preprocess_func(env_name)
 
         # define network
@@ -150,16 +147,26 @@ class Learner:
         define network and get initial parameter to copy to angents
         """
 
+        # 先在CPU上初始化
+        self.in_online_q_network.to('cpu')
+        self.in_target_q_network.to('cpu')
+        self.ex_online_q_network.to('cpu')
+        self.ex_target_q_network.to('cpu')
+        self.embedding_net.to('cpu')
+        self.embedding_classifier.to('cpu')
+        self.trained_lifelong_net.to('cpu')
+        self.original_lifelong_net.to('cpu')
+    
         observation, _ = self.env.reset()
         frame = self.frame_process_func(observation)
         frames = [frame] * self.n_frames
         
         # 将输入数据移动到与模型相同的设备上
-        state = torch.tensor(np.stack(frames, axis=0)[None, ...]).float().to(self.device)
-        h = torch.zeros(1, 1, self.in_online_q_network.lstm.hidden_size).float().to(self.device)
-        c = torch.zeros(1, 1, self.ex_online_q_network.lstm.hidden_size).float().to(self.device)
-        prev_action = torch.tensor([0]).to(self.device)
-        prev_rewards = torch.tensor([0]).float().to(self.device)
+        state = torch.tensor(np.stack(frames, axis=0)[None, ...]).float()
+        h = torch.zeros(1, 1, self.in_online_q_network.lstm.hidden_size).float()
+        c = torch.zeros(1, 1, self.ex_online_q_network.lstm.hidden_size).float()
+        prev_action = torch.tensor([0])
+        prev_rewards = torch.tensor([0]).float()
 
         self.in_online_q_network(state,
                                 states=(h, c),
@@ -208,9 +215,8 @@ class Learner:
         trained_lifelong_weight = self.trained_lifelong_net.state_dict()
         original_lifelong_weight = self.original_lifelong_net.state_dict()
         
-        # 将模型移回设备
         self.set_device()
-
+        
         return in_q_weight, ex_q_weight, embed_weight, trained_lifelong_weight, original_lifelong_weight
       
     def save(self, weight_dir, cycle):
@@ -221,8 +227,8 @@ class Learner:
           cycle      (int): the number of times the learning has been completed
         """
 
-        torch.save(self.online_q_network.state_dict(), os.path.join(weight_dir, f"q_weight_{cycle}.pth"))
-        torch.save(self.online_policy_net.state_dict(), os.path.join(weight_dir, f"policy_weight_{cycle}.pth"))
+        torch.save(self.in_online_q_network.state_dict(), os.path.join(weight_dir, f"in_q_weight_{cycle}.pth"))
+        torch.save(self.ex_online_q_network.state_dict(), os.path.join(weight_dir, f"ex_q_weight_{cycle}.pth"))
         torch.save(self.embedding_net.state_dict(), os.path.join(weight_dir, f"embed_weight_{cycle}.pth"))
         torch.save(self.embedding_classifier.state_dict(), os.path.join(weight_dir, f"embed_classifier_weight_{cycle}.pth"))
         torch.save(self.trained_lifelong_net.state_dict(), os.path.join(weight_dir, f"trained_lifelong_weight_{cycle}.pth"))
@@ -241,8 +247,7 @@ class Learner:
         """
 
         indices, weights, compressed_segments = minibatch
-        segments = [pickle.loads(lz4f.decompress(compressed_seg))
-                    for compressed_seg in compressed_segments]
+        segments = [pickle.loads(compressed_seg) for compressed_seg in compressed_segments]
         return indices, weights, segments
 
     def update_network(self, minibatchs):
@@ -286,13 +291,20 @@ class Learner:
                 embed_losses.append(embed_loss)
                 lifelong_losses.append(lifelong_loss)
 
-        in_q_weight = self.in_online_q_network.to('cpu').state_dict()
-        ex_q_weight = self.ex_online_q_network.to('cpu').state_dict()
-        embed_weight = self.embedding_net.to('cpu').state_dict()
-        lifelong_weight = self.trained_lifelong_net.to('cpu').state_dict()
+        # 确保模型在返回权重前在CPU上
+        self.in_online_q_network.to('cpu')
+        self.ex_online_q_network.to('cpu')
+        self.embedding_net.to('cpu')
+        self.trained_lifelong_net.to('cpu')
         
+        in_q_weight = self.in_online_q_network.state_dict()
+        ex_q_weight = self.ex_online_q_network.state_dict()
+        embed_weight = self.embedding_net.state_dict()
+        lifelong_weight = self.trained_lifelong_net.state_dict()
+        
+        # 将模型移回设备
         self.set_device()
-
+    
         return in_q_weight, ex_q_weight, embed_weight, lifelong_weight, indices_all, priorities_all, \
                 np.mean(in_q_losses), np.mean(ex_q_losses), np.mean(embed_losses), np.mean(lifelong_losses)
 
